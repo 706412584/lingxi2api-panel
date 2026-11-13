@@ -24,6 +24,29 @@ var errEmptyStream = errors.New("upstream stream contained no valid data events"
 // upstream_parse 同语义），与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
+// AggregateError 上游在流里明确报错（error 帧）。与「空流/解析失败」区分：
+// 这个错误带上游自己的 message 与 code，可以原样告诉客户端是什么坏了。
+type AggregateError struct {
+	Message string
+	Code    string
+}
+
+func (e *AggregateError) Error() string {
+	if e.Code != "" {
+		return e.Message + "（上游错误码 " + e.Code + "）"
+	}
+	return e.Message
+}
+
+// AsAggregateError 取出流内报错；不是则返回 nil。
+func AsAggregateError(err error) *AggregateError {
+	var ae *AggregateError
+	if errors.As(err, &ae) {
+		return ae
+	}
+	return nil
+}
+
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
@@ -154,6 +177,22 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			} else {
 				var chunk map[string]any
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
+					// 上游 error 帧（HTTP 200 + 流内错误，如 6004 限流、灵犀的
+					// "AI服务异常"）：这不是可聚合的内容帧，必须原样上抛成聚合错误。
+					// 否则非流式请求会把它当「没有 choices 的普通帧」跳过，最后走
+					// 「空流 → upstream_parse」，把「上游明确报错」说成「解析失败」，
+					// 错误原因和 code 全部丢失。
+					if e, hasErr := chunk["error"]; hasErr && e != nil {
+						if m, ok := e.(map[string]any); ok {
+							msg, _ := m["message"].(string)
+							code, _ := m["code"].(string)
+							if msg == "" {
+								msg = "上游返回错误"
+							}
+							return nil, &AggregateError{Message: msg, Code: code}
+						}
+						return nil, &AggregateError{Message: "上游返回错误"}
+					}
 					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
 					validEvents++
 					if v, ok := chunk["id"].(string); ok && id == "" {

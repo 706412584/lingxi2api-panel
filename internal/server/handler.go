@@ -1170,6 +1170,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rc.Close()
 		if err != nil {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			// 上游在流里明确报错（HTTP 200 + error 帧）：这是上游的结论，不是
+			// 网关解析失败。必须把上游自己的 message/code 透出去，并按错误种类
+			// 处置账号——否则真正原因会丢失，只剩一句「解析失败」。
+			if ae := upstream.AsAggregateError(err); ae != nil {
+				kind := upstream.FrameKind(fmt.Sprintf(`{"error":{"message":%q,"code":%q}}`, ae.Message, ae.Code))
+				h.applyErrorPolicy(acct.UID, kind, err.Error(), bareModel, nil)
+				fail(acct.UID)
+				writeOpenAIErrorHint(w, http.StatusBadGateway, "upstream_error", ae.Error(),
+					h.hintOf(kind, err.Error(), bareModel, reqHasImage, nil))
+				st.status = http.StatusBadGateway
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway

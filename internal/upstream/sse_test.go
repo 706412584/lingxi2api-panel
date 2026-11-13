@@ -681,6 +681,72 @@ func TestAggregateEmptyStreamError(t *testing.T) {
 	}
 }
 
+// 上游 error 帧必须上抛成带原因的 AggregateError，而不是被当成空流报「解析失败」。
+// 回归背景：非流式请求撞上「200 + 流内错误」时，以前只报 upstream_parse，
+// 上游自己的 code/message 全丢，运维无法判断是限流、审核还是账号失效。
+func TestAggregateUpstreamErrorFrame(t *testing.T) {
+	raw := "data: {\"error\":{\"message\":\"AI服务异常\",\"code\":\"AIError\"}}\n\n" +
+		"data: [DONE]\n\n"
+	_, err := Aggregate(strings.NewReader(raw))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	ae := AsAggregateError(err)
+	if ae == nil {
+		t.Fatalf("应识别为上游 error 帧，实际: %v", err)
+	}
+	if ae.Code != "AIError" {
+		t.Fatalf("code=%q want AIError", ae.Code)
+	}
+	if !strings.Contains(err.Error(), "AI服务异常") {
+		t.Fatalf("错误文本丢失上游 message: %v", err)
+	}
+	// 不能再被当成「空流/解析失败」
+	if IsEmptyStreamError(err) {
+		t.Fatal("上游明确报错不应归类为空流")
+	}
+}
+
+// 上游自报的网关级故障（灵犀 AIError / "AI服务异常"）必须归一化为 ErrServer。
+//
+// 回归背景：error 帧没有 HTTP status，FrameKind 固定按 400 口径走 Classify，
+// 于是 AIError 落到 ErrClient——换号却不喂熔断、也不告诉客户端是上游坏了，
+// 排障只能看到「网关 503」。实测 22:41-22:42 连续 6 次真实请求全被这样归类。
+func TestFrameKindUpstreamFault(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    ErrKind
+	}{
+		{"灵犀 AIError（message 为空）", `{"error":{"code":"AIError","message":"AI服务异常","type":"upstream_error"}}`, ErrServer},
+		{"AI服务异常文案", `{"error":{"message":"AI服务异常"}}`, ErrServer},
+		{"InternalError 码", `{"error":{"code":"InternalError","message":"boom"}}`, ErrServer},
+		{"上游 generic 文案", `{"error":{"message":"Internal Server Error"}}`, ErrServer},
+		// 请求级错误不能被误升成 ErrServer
+		{"普通客户端错误", `{"error":{"message":"invalid request parameters"}}`, ErrClient},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := FrameKind(c.payload); got != c.want {
+				t.Fatalf("FrameKind(%s)=%v want %v", c.payload, got, c.want)
+			}
+		})
+	}
+}
+
+// 正常流不能因为新增的 error 帧识别而受影响。
+func TestAggregateNormalChunkNotMistakenForError(t *testing.T) {
+	raw := "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("正常流报错: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("空结果")
+	}
+}
+
 // TestStreamEmptyFramesCase 覆盖流式空流检测：0 有效帧时写 error 帧（error 字段存活）,
 // 恰好一个 [DONE]，并返回非 nil error。
 func TestStreamEmptyFramesCase(t *testing.T) {

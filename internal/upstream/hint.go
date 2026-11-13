@@ -12,6 +12,7 @@ package upstream
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -116,12 +117,46 @@ func FrameKind(payload string) ErrKind {
 	var f struct {
 		Error struct {
 			Message string `json:"message"`
+			Code    any    `json:"code"`
 		} `json:"error"`
 	}
-	if json.Unmarshal([]byte(payload), &f) != nil || f.Error.Message == "" {
+	if json.Unmarshal([]byte(payload), &f) != nil {
+		return ErrNone
+	}
+	// 上游自报的网关级故障码（灵犀 AIError："AI服务异常"）：这不是客户端请求
+	// 有问题，换什么参数都一样，属于**上游故障**。若不在这里先判，下面会拿
+	// 空 message 去 Classify(400) 兜底成 ErrClient——换号但不罚号、也不告诉
+	// 客户端是上游坏了，排障时只会看到「网关 503」而不知道原因。
+	if code, msg := frameCodeString(f.Error.Code), f.Error.Message; isUpstreamFault(code, msg) {
+		return ErrServer
+	}
+	if f.Error.Message == "" {
 		return ErrNone
 	}
 	return Classify(http.StatusBadRequest, f.Error.Message)
+}
+
+// isUpstreamFault 判定帧是「上游自己坏了」而不是「请求有问题」。
+// 只认上游明确给出的故障码/文案，避免把普通 4xx 误升成 ErrServer（那会触发
+// 账号冷却与重试风暴）。
+func isUpstreamFault(code, msg string) bool {
+	switch strings.ToLower(code) {
+	case "aierror", "internalerror", "servererror", "upstream_error":
+		return true
+	}
+	lower := strings.ToLower(msg)
+	return strings.Contains(msg, "AI服务异常") || strings.Contains(lower, "internal server error")
+}
+
+// frameCodeString 把帧里的 code 统一成字符串（可能是 string 也可能是 number）。
+func frameCodeString(v any) string {
+	switch c := v.(type) {
+	case string:
+		return c
+	case float64:
+		return strconv.FormatInt(int64(c), 10)
+	}
+	return ""
 }
 
 // isModelParamInvalid 上游 11133 body 判定（code 11133 / extError.code=

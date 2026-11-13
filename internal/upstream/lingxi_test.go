@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -137,6 +138,89 @@ func TestIsAuditReply(t *testing.T) {
 		if got := isAuditReply(c.msg, c.code); got != c.want {
 			t.Fatalf("isAuditReply(%q,%q)=%v, want %v", c.msg, c.code, got, c.want)
 		}
+	}
+}
+
+// translateStream 对上游业务错误的输出形态。
+//
+// 回归背景：上游「200 + 流内 code=AIError, message 为空」曾被转成
+// delta.content="\n[上游错误] AI服务异常" + finish_reason=stop，
+// 客户端会把这句话当成模型的正常回答（agent 继续处理，重试不触发），
+// 日志也把这次请求记成 success。正确形态是标准 error 帧。
+func TestTranslateStreamUpstreamErrorBecomesErrorFrame(t *testing.T) {
+	src := strings.NewReader(
+		"data: {\"code\":\"AIError\",\"message\":\"\"}\n\n" +
+			"data: {\"code\":\"Success\",\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\n" +
+			"data: [DONE]\n\n")
+
+	pr, pw := io.Pipe()
+	go translateStream(src, pw, "deepseek-v4.1-flash")
+	out, err := io.ReadAll(pr)
+	if err != nil {
+		t.Fatalf("read translated stream: %v", err)
+	}
+	text := string(out)
+
+	if strings.Contains(text, "[上游错误]") {
+		t.Fatalf("错误仍被伪装成正文：%s", text)
+	}
+	if !strings.Contains(text, `"error"`) {
+		t.Fatalf("没有输出 error 帧：%s", text)
+	}
+	if !strings.Contains(text, `"code":"AIError"`) {
+		t.Fatalf("error 帧丢了上游 code：%s", text)
+	}
+	// message 为空时必须补一句可读原因，不能给客户端空字符串
+	if !strings.Contains(text, "AI服务异常") {
+		t.Fatalf("message 为空时未补可读原因：%s", text)
+	}
+	// 绝不能同时给出「正常 finish_reason=stop」——那会让客户端认为是完整回答
+	if strings.Contains(text, `"finish_reason":"stop"`) {
+		t.Fatalf("错误帧不应附带正常结束标记：%s", text)
+	}
+}
+
+// 审核拒答必须保持原语义：这是上游正常拒答，不能改成 error 帧
+// （重试只会得到同一句话），也不能套「[上游错误]」前缀。
+func TestTranslateStreamAuditReplyStaysContentFilter(t *testing.T) {
+	// 上游命中审核时：code 是失败码，message 是兜底话术（也可能是正文 text）。
+	src := strings.NewReader(
+		"data: {\"code\":\"AuditFailed\",\"message\":\"我还在不断学习中，暂时无法回答此问题\"}\n\n" +
+			"data: [DONE]\n\n")
+
+	pr, pw := io.Pipe()
+	go translateStream(src, pw, "deepseek-v4.1-flash")
+	out, _ := io.ReadAll(pr)
+	text := string(out)
+
+	if strings.Contains(text, `"error"`) {
+		t.Fatalf("审核拒答被误判成上游故障：%s", text)
+	}
+	if !strings.Contains(text, "content_filter") {
+		t.Fatalf("审核拒答应走 content_filter：%s", text)
+	}
+	if strings.Contains(text, "[上游错误]") {
+		t.Fatalf("审核拒答不该带「上游错误」前缀：%s", text)
+	}
+}
+
+// 正常流不受影响：正文与结束帧照常。
+func TestTranslateStreamNormalFlowUnchanged(t *testing.T) {
+	src := strings.NewReader(
+		"data: {\"code\":\"Success\",\"choices\":[{\"text\":\"你好\"}]}\n\n" +
+			"data: {\"code\":\"Success\",\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n" +
+			"data: [DONE]\n\n")
+
+	pr, pw := io.Pipe()
+	go translateStream(src, pw, "deepseek-v4.1-flash")
+	out, _ := io.ReadAll(pr)
+	text := string(out)
+
+	if !strings.Contains(text, "你好") {
+		t.Fatalf("正常正文丢失：%s", text)
+	}
+	if strings.Contains(text, `"error"`) {
+		t.Fatalf("正常流不该出现 error 帧：%s", text)
 	}
 }
 

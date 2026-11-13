@@ -519,6 +519,10 @@ func translateStream(src io.Reader, pw *io.PipeWriter, model string) {
 	created := time.Now().Unix()
 	roleSent := false
 	sentUsage := false
+	// settled 表示本次流已经**定局**（上游给了错误，或已给出 finish_reason）。
+	// 定局之后绝不能再补一帧 finish_reason=stop：那会让客户端同时看到
+	// 「上游报错」与「模型正常说完」两个互相矛盾的信号。
+	settled := false
 
 	emit := func(delta map[string]any, finish string, usage map[string]any) {
 		choice := map[string]any{"index": 0, "delta": delta, "finish_reason": nil}
@@ -532,6 +536,26 @@ func translateStream(src io.Reader, pw *io.PipeWriter, model string) {
 		if usage != nil {
 			obj["usage"] = usage
 			obj["choices"] = []any{}
+		}
+		b, _ := json.Marshal(obj)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		w.Flush()
+	}
+
+	// emitError 写一帧标准 OpenAI error（与 sse.go 的 error-passthrough 同形）。
+	//
+	// 为什么不能像以前那样把错误塞进 delta.content：那样客户端看到的是
+	// 「模型正常回答了 `[上游错误] AI服务异常`」，finish_reason 还是 stop——
+	// 下游 agent 会把它当正文继续处理，重试逻辑也完全不会触发。
+	// 上游这次是 HTTP 200 但流内 code != Success，收尾还会发 [DONE]，
+	// 唯一能把「失败」表达清楚的通道就是 error 帧（gateway_hint 也挂在这上面）。
+	emitError := func(msg, code string) {
+		obj := map[string]any{
+			"error": map[string]any{
+				"message": msg,
+				"type":    "upstream_error",
+				"code":    code,
+			},
 		}
 		b, _ := json.Marshal(obj)
 		fmt.Fprintf(w, "data: %s\n\n", b)
@@ -558,18 +582,26 @@ func translateStream(src io.Reader, pw *io.PipeWriter, model string) {
 		}
 		if f.Code != "" && !strings.EqualFold(f.Code, "Success") {
 			msg := f.Message
-			if msg == "" {
-				msg = "AI服务异常"
-			}
 			// 内容审核：灵犀命中敏感内容时不下发错误码，而是用一句兜底话术
 			// （「我还在不断学习中，暂时无法回答此问题」）当正文返回。
-			// 这时按 OpenAI 的 content_filter 语义透传原文，不要再套「[上游错误]」——
-			// 那会让用户以为网关炸了，实际是上游拒答。
+			// 这时按 OpenAI 的 content_filter 语义透传原文，不要改成 error 帧——
+			// 那是上游的**正常拒答**，重试也只会得到同一句话。
 			if isAuditReply(msg, f.Code) {
+				if msg == "" {
+					msg = "内容被上游安全策略拦截"
+				}
 				emit(map[string]any{"content": msg}, "content_filter", nil)
 				break
 			}
-			emit(map[string]any{"content": "\n[上游错误] " + msg}, "stop", nil)
+			// 其余业务错误（含 message 为空的「AI服务异常」）一律走标准 error 帧：
+			// 以前塞进 delta.content + finish_reason=stop，客户端会把它当成模型的
+			// 正常回答——下游 agent 继续处理这段文字，重试逻辑也完全不触发。
+			// 上游这次是 HTTP 200 + 流内错误码，能表达失败的通道只有 error 帧。
+			if msg == "" {
+				msg = "AI服务异常"
+			}
+			emitError(msg, f.Code)
+			settled = true
 			break
 		}
 		var usage map[string]any
@@ -642,11 +674,14 @@ func translateStream(src io.Reader, pw *io.PipeWriter, model string) {
 				sentUsage = true
 				emit(map[string]any{}, "", usage)
 			}
+			settled = true // 上游给出了 finish_reason
 			break
 		}
 	}
-	if !sentUsage {
-		// 保证有收尾
+	// 只有**正常**收尾才补 finish_reason。错误帧之后绝不能再补一帧 stop：
+	// 那会让客户端同时看到「上游报错」与「模型正常说完」两个互相矛盾的信号，
+	// 有的客户端会忽略 error 帧、只认 finish_reason=stop，于是又把失败当成功。
+	if !sentUsage && !settled {
 		emit(map[string]any{}, "stop", nil)
 	}
 	fmt.Fprint(w, "data: [DONE]\n\n")

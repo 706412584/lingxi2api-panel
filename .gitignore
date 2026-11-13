@@ -40,6 +40,8 @@ docs/
 /login.exe
 /credit.exe
 /lingxi2api.exe
+# 替换二进制时留下的旧版备份（go build -o 覆盖前的 ~ 后缀）
+/lingxi2api.exe~
 
 # 浏览器登录的独立 profile（含残留 cookie，绝不能提交）
 browser-profile/
