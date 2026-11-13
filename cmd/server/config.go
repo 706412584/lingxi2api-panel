@@ -61,6 +61,15 @@ type Config struct {
 		// 关掉。关闭后 Event.ClientIP/UserAgent 保持为空，归档里不出现该字段。
 		// 热生效（经 livecfg 快照），无需重启。
 		RequestClientInfo bool `json:"request_client_info"`
+		// RequestBodyDigest 是否在出站前打印一行**请求结构摘要**（不含正文）。
+		// 缺省 false：只在排查「上游一直报错但看日志找不到线索」时临时打开。
+		//
+		// 为什么只给摘要而不落正文：正文可能含用户对话、代码、密钥。排障真正
+		// 需要的是「形状」——消息条数、各条 role 与长度、tools 数量、是否带图、
+		// 请求的 effort/max_tokens、模型名。这些足以判断是上下文超限、工具声明
+		// 丢失、还是参数不被上游接受，且不会把内容写进日志。
+		// 热生效（经 livecfg 快照），无需重启。
+		RequestBodyDigest bool `json:"request_body_digest"`
 	} `json:"logging"`
 
 	Server struct {

@@ -262,6 +262,7 @@ func main() {
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		RequestBodyDigest:    cfg.Logging.RequestBodyDigest,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
@@ -347,6 +348,9 @@ func main() {
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		RequestBodyDigest: cfg.Logging.RequestBodyDigest,
+		// 失败请求采样目录：与 state 文件同目录，跟随 state_file 配置一起搬移。
+		SampleDir: stateSibling(cfg.StateFile, "failed-requests"),
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
@@ -538,6 +542,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		RequestBodyDigest:    newCfg.Logging.RequestBodyDigest,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)

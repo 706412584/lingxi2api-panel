@@ -49,6 +49,12 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		obj["stream_options"] = map[string]any{"include_usage": true}
 	}
 	normalizeToolChoice(obj)
+	// 工具参数 schema 归一化（见 toolschema.go）：上游不接受 properties 直接子级的
+	// anyOf/oneOf/allOf（或无类型的属性），会把整个请求拒成 code=AIError。
+	// 注意：这条管线服务的是 workbuddy 上游；灵犀走 lingxiChatStream →
+	// lxRewriteBody，那里也调了一次 normalizeToolSchema（两边都要保留：
+	// 灵犀适配壳与 WB 实现共用同一个 Client）。
+	normalizeToolSchema(obj)
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)

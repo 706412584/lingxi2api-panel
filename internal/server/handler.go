@@ -78,6 +78,14 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// RequestBodyDigest 是否打印请求结构摘要（不含正文）。来自
+	// logging.request_body_digest，缺省关；Live 为 nil 的裸用/测试路径用此静态值。
+	RequestBodyDigest bool
+
+	// SampleDir 失败请求采样目录（仅 RequestBodyDigest 打开时使用）。
+	// 由 main 按 state 文件同目录推导后注入，与 request-logs 同一惯例。
+	SampleDir string
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -86,10 +94,11 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:           h.cfg.APIKey,
-		SoftCooldown:     h.cfg.SoftCooldown,
-		RecordClientInfo: h.cfg.RecordClientInfo,
-		HiddenModels:     livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
+		APIKey:            h.cfg.APIKey,
+		SoftCooldown:      h.cfg.SoftCooldown,
+		RecordClientInfo:  h.cfg.RecordClientInfo,
+		RequestBodyDigest: h.cfg.RequestBodyDigest,
+		HiddenModels:      livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
 	}
 }
 
@@ -601,6 +610,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.done()
 
+	// 请求结构摘要（logging.request_body_digest，缺省关）：排障时临时打开，
+	// 看的是请求「形状」而非正文——消息条数/长度、tools 名合法性、effort、
+	// 是否带图。上游只回一句「AI服务异常」时，这些形状信息是唯一定位手段。
+	if h.loadLive().RequestBodyDigest {
+		log.Printf("INFO: [server] request digest: %s", RequestDigest(body))
+	}
+
 	// models.hidden 黑名单：点名调用直接拒绝，不打上游、不占选号。
 	// 与 /v1/models 的列表过滤对称（只藏列表不够，知道名字仍可硬调）。
 	if _, hide := h.loadLive().HiddenModels[realm+":"+bareModel]; hide {
@@ -1105,6 +1121,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(errFrame, 200))
+				// 采样失败请求原文（仅在 request_body_digest 打开时）：
+				// 上游只回一句「AI服务异常」时，唯一的定位手段就是拿这份 body
+				// 在本地逐项删减复现。落盘位置 data/failed-requests/。
+				if h.loadLive().RequestBodyDigest {
+					h.sampleFailedRequest(body, bareModel, errFrame)
+				}
 			case sErr != nil:
 				// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功
 				// （与 default 同语义），请求日志归为 Interrupted（人已走，未完成）。

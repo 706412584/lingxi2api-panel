@@ -467,6 +467,12 @@ func lxRewriteBody(body []byte) ([]byte, string, error) {
 	if eff, ok := in["reasoning_effort"].(string); ok && strings.TrimSpace(eff) != "" {
 		in["llm_arguments"] = map[string]any{"reasoning_effort": eff}
 	}
+	// 工具参数 schema 归一化（见 toolschema.go）：灵犀上游拒收 properties 直接
+	// 子级里「只有 anyOf/oneOf/allOf 或连类型都没有」的属性，表现为
+	// code=AIError、message 为空，整个请求（含全部 tools）失败。
+	// 这里是灵犀真正的出站改写入口——注意不能用 workbuddy 那套 prepareBody：
+	// ChatStreamContext 走的是 lingxiChatStream，不经 prepareBody。
+	normalizeToolSchema(in)
 	out, err := json.Marshal(in)
 	return out, model, err
 }
