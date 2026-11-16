@@ -1325,6 +1325,30 @@ func TestFallbackAllHardReturnsNil(t *testing.T) {
 	}
 }
 
+func TestFallbackSkipsActiveDegrade(t *testing.T) {
+	p := New("")
+	p.SetDegrade(1, time.Hour, 2*time.Hour)
+	p.Add(&auth.Auth{UID: "degraded"})
+	p.NoteFailures("degraded")
+	if got := p.Pick(); got != nil {
+		t.Fatalf("active degrade must not be fallback-picked, got %+v", got)
+	}
+	// 高并发下也不能借全冷却兜底提前捞出硬冷却账号。
+	var wg sync.WaitGroup
+	found := make(chan *auth.Auth, 32)
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); found <- p.Pick() }()
+	}
+	wg.Wait()
+	close(found)
+	for got := range found {
+		if got != nil {
+			t.Fatalf("concurrent Pick should return nil during hard cooldown, got %+v", got)
+		}
+	}
+}
+
 func TestFallbackSoftAndBreakerParticipate(t *testing.T) {
 	// D3：soft 与 breaker 冷却号允许参与兜底，取最早到期者。
 	p := New("")
@@ -2013,6 +2037,72 @@ func TestReviveClearsPaused(t *testing.T) {
 	}
 	if got := p.Pick(); got == nil || got.UID != "u1" {
 		t.Errorf("Revive 后应可选, got %+v", got)
+	}
+}
+
+// TestReviveClearsDegrade 人工解冻同时清部分连败与已生效降权，落盘后旧状态不复活。
+func TestReviveClearsDegrade(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := New(fp)
+	p.SetDegrade(2, time.Hour, 2*time.Hour)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteFailures("u1")
+	if st, _ := p.Status("u1"); st.ConsecutiveFails != 1 || !st.DegradeUntil.IsZero() {
+		t.Fatalf("首次失败应只累计计数: %+v", st)
+	}
+	p.NoteFailures("u1")
+	if st, _ := p.Status("u1"); st.DegradeUntil.IsZero() {
+		t.Fatalf("达阈后应进入降权: %+v", st)
+	}
+	if got := p.AvailableUIDs(); len(got) != 0 {
+		t.Fatalf("降权账号不应进入正常候选池: %v", got)
+	}
+	if !p.Revive("u1") {
+		t.Fatal("Revive 应返回 true")
+	}
+	st, _ := p.Status("u1")
+	if st.ConsecutiveFails != 0 || !st.DegradeUntil.IsZero() {
+		t.Fatalf("Revive 应清连败计数与降权截止: %+v", st)
+	}
+	if got := p.AvailableUIDs(); len(got) != 1 || got[0] != "u1" {
+		t.Fatalf("Revive 后应恢复正常候选池: %v", got)
+	}
+	p.Flush()
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if st, _ := p2.Status("u1"); st.ConsecutiveFails != 0 || !st.DegradeUntil.IsZero() {
+		t.Fatalf("重载后旧降权不得复活: %+v", st)
+	}
+}
+
+func TestNoteSuccessDoesNotClearActiveDegrade(t *testing.T) {
+	p := New("")
+	p.SetDegrade(1, time.Hour, 2*time.Hour)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteFailures("u1")
+	before, _ := p.Status("u1")
+	// 模拟降权前已在途的请求随后成功：计数可清，但硬冷却截止必须保留。
+	p.NoteSuccess("u1")
+	after, _ := p.Status("u1")
+	if after.ConsecutiveFails != 0 {
+		t.Fatalf("成功应清连败计数: %+v", after)
+	}
+	if !after.DegradeUntil.Equal(before.DegradeUntil) {
+		t.Fatalf("旧在途成功不得提前解除硬冷却: before=%v after=%v", before.DegradeUntil, after.DegradeUntil)
+	}
+	if got := p.Pick(); got != nil {
+		t.Fatalf("硬冷却期间仍不应选号: %+v", got)
+	}
+	// 到期后沿用惰性恢复；历史时间戳可在下一次成功时清理。
+	p.mu.Lock()
+	p.byUID["u1"].degradeUntil = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+	if got := p.Pick(); got == nil || got.UID != "u1" {
+		t.Fatalf("到期后应恢复正常选号: %+v", got)
+	}
+	p.NoteSuccess("u1")
+	if st, _ := p.Status("u1"); !st.DegradeUntil.IsZero() {
+		t.Fatalf("到期后的历史时间戳应可清理: %+v", st)
 	}
 }
 

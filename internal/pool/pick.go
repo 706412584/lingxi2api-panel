@@ -327,6 +327,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
 		}
+		if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
+			continue // 连败降权是严格硬冷却：未到期不参与兜底，只有到期或人工 Revive 才恢复
+		}
 		if p.floorBlockedForRealmModel(e, model, realm, now) {
 			continue // 积分保底：触底号不接收费模型（兜底路径同判据）
 		}

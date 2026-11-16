@@ -70,7 +70,7 @@ func (p *Pool) ReviveDisabled(uid string) {
 	}
 }
 
-// Revive 运维口径的"无条件恢复"：清禁用、冷却（含软退避计数）与熔断运行态。
+// Revive 运维口径的"无条件恢复"：清禁用、冷却（含软退避计数）、熔断与连败降权运行态。
 // 与 ReviveDisabled（只清禁用）和 ReenableIfCredits（只清冷却、不动熔断）的区别：
 // 本方法清除全部惩罚状态，供管理面板"解冻"按钮使用——人工判断该号可用时一键恢复。
 // uid 不存在返回 false（供调用方区分"账号不存在"与"已复活"）。
@@ -89,6 +89,8 @@ func (p *Pool) Revive(uid string) bool {
 	e.softStreak = 0
 	e.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
 	e.sessionDeadFails = 0
+	e.consecutiveFails = 0
+	e.degradeUntil = time.Time{}
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
@@ -165,8 +167,9 @@ func (p *Pool) NoteError(uid string) {
 // NoteSuccess 成功请求累加成功计数、刷新 lastSuccess，并清空连续失败与熔断运行态。
 // 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
 // 额外清 softStreak：成功是账号已恢复的最强证据，连续软限流计数就此归零、退避回到基数。
-// 同样清 sessionDeadFails 与连败降权计数（consecutiveFails/degradeUntil，issue #114）：
-// 成功证明账号当前可用，连败计数与临时出池截止一并归零。
+// 同样清 sessionDeadFails 与连败计数（issue #114）。连败降权是严格硬冷却：
+// 未到期时即使是降权前旧在途请求成功，也不能提前解除 degradeUntil；到期后的历史时间戳可清。
+// 人工 Revive 才是唯一提前解除降权的入口。
 // **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
 // 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/复活/账号级
 // 冷却（Cooldown/reviveCoolingLocked）清除。11102 条目的成功清理由 handler 在
@@ -183,7 +186,9 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.softStreak = 0
 		e.sessionDeadFails = 0
 		e.consecutiveFails = 0
-		e.degradeUntil = time.Time{}
+		if e.degradeUntil.IsZero() || !time.Now().Before(e.degradeUntil) {
+			e.degradeUntil = time.Time{}
+		}
 		p.dirty.Store(true)
 	}
 }

@@ -1,4 +1,4 @@
-// 连败降权（issue #114）：NoteFailures 计数 + 达阈临时出池 + NoteSuccess 清零。
+// 连败降权（issue #114）：NoteFailures 计数 + 达阈临时出池 + 到期/人工 Revive 恢复。
 // 与冷却/熔断「并存取更长者不叠加」由 entry.healthy 的并列或门天然保证
 // （三个截止是或门，任一未到期即不可选，生效的一定是最远者——见 entry.degradeUntil 注释）。
 package pool
@@ -9,8 +9,8 @@ import "time"
 // consecutiveFails++，达到 degradeThreshold 触发降权（degradeUntil = now +
 // 降权时长，计数清零供下一轮重新累计——同 recordBreakerFailureLocked 哲学）。
 // **已在降权期内**（degradeUntil 未到期）再次达阈：不延长、不翻倍（防用户重试
-// 把降权越堆越厚，与 CooldownSoftRate 兜底探测同哲学）——计数清零，到期放行后
-// 需重新连败满阈值才再降。成功（NoteSuccess）清零计数并清降权截止。
+// 把降权越堆越厚）——计数清零，到期放行后需重新连败满阈值才再降。
+// 严格硬冷却期间不参与全冷却兜底；旧在途成功只清计数，不提前解除截止。
 //
 // 谁该喂：ErrClient（未知 4xx，applyErrorPolicy default 只换号不罚）与传输层
 // 失败（handler 网络抖动分支，同样只换号不罚）——两者都是「不知道原因的失败」，
