@@ -271,20 +271,24 @@ func TestMessagesSearchUpstreamErrorShape(t *testing.T) {
 	}
 }
 
-// TestMessagesRouteDoesNotShadowV1Messages 断言搜索端点没有占用 /v1/messages
-// （该路径保留给 Anthropic 模型对话）。
-func TestMessagesRouteDoesNotShadowV1Messages(t *testing.T) {
+// TestSearchRouteDoesNotShadowMessages 断言搜索端点 /v1/search/messages 没有
+// 占用 /v1/messages。两条路径都已注册，本测试只验证搜索路径独立工作、
+// 不被 chat 通路抢占。/v1/messages 的端到端验证见 anthropic_test.go。
+func TestSearchRouteDoesNotShadowMessages(t *testing.T) {
 	up := newSearchUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Error("不得打上游")
+		// 搜索路径正常转发到上游（若被抢占则不会到这里）。
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","results":[]}`))
 	})
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{}`)))
+	body := `{"model":"kimi-k3.1-pro","max_tokens":8,"messages":[{"role":"user","content":"ping"}],"tools":[{"name":"web_search","description":"search","input_schema":{"type":"object","properties":{}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/search/messages", bytes.NewReader([]byte(body)))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("POST /v1/messages code=%d want 404（该路径留给模型对话）", rec.Code)
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("/v1/search/messages 必须仍然注册")
 	}
 }
 

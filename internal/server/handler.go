@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -150,8 +151,12 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// Anthropic Messages API（Claude Code / Cline 客户端直连）。请求/响应在
+	// anthropic.go 翻译后委托给 chatCompletions，因此选号/粘性/冷却/审核识别
+	// 与 OpenAI 通路完全一致。
+	h.mux.HandleFunc("POST /v1/messages", h.withAuth(h.anthropicChat))
 	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径刻意不占用
-	// /v1/messages——那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发。
+	// /v1/messages——那是 Anthropic 模型对话的标准路径。
 	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.messages))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -1334,6 +1339,49 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
+}
+
+// anthropicChat 是 Anthropic Messages API 的入口：请求体转 OpenAI、响应 Writer
+// 包装，然后委托给 chatCompletions 走完整选号/重试/冷却/统计链路。
+//
+// 完整复用的好处：审核识别（internal/prompt）、模型级冷却、连败硬冷却、粘性
+// 会话、用量账本、请求日志这些只有 chatCompletions 内做了的特性，Anthropic 通路
+// 自动一致。如果将来 chatCompletions 新增功能，/v1/messages 不需要同步修改。
+func (h *Handler) anthropicChat(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "invalid_request_error",
+				"message": "read body: " + err.Error(),
+			},
+		})
+		return
+	}
+	names := newToolNameMap()
+	converted, err := anthropicToOpenAI(body, names)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "invalid_request_error",
+				"message": err.Error(),
+			},
+		})
+		return
+	}
+	// peek model/stream 用于响应 writer 初始化（model 透传到 Anthropic 响应体）。
+	var peek struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+	}
+	_ = json.Unmarshal(converted, &peek)
+	r.Body = io.NopCloser(bytes.NewReader(converted))
+	r.ContentLength = int64(len(converted))
+	aw := newAnthropicWriter(w, peek.Model, peek.Stream, names)
+	defer aw.Close()
+	h.chatCompletions(aw, r)
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
