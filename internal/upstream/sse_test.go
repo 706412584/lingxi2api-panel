@@ -723,7 +723,13 @@ func TestFrameKindUpstreamFault(t *testing.T) {
 		{"InternalError 码", `{"error":{"code":"InternalError","message":"boom"}}`, ErrServer},
 		{"上游 generic 文案", `{"error":{"message":"Internal Server Error"}}`, ErrServer},
 		// 请求级错误不能被误升成 ErrServer
-		{"普通客户端错误", `{"error":{"message":"invalid request parameters"}}`, ErrClient},
+		// 流内 error 帧的判定固定按 400 口径（FrameKind 调 Classify(400)），
+		// 未识别文案同样落请求级：不罚号、不喂连败（Lingxi 流内错误帧没有额外的
+		// 账号级证据，凭一句未知文案给账号记连败正是 2026-11-18 事故的根因）。
+		{"普通客户端错误", `{"error":{"message":"bad request"}}`, ErrRequestRejected},
+		// 11133 家族是请求级拒绝（不轮转/不喂连败），仍不是 ErrServer。
+		{"参数被拒（11133 文案）", `{"error":{"message":"invalid request parameters"}}`, ErrRequestRejected},
+		{"工具历史断裂（11148 文案）", `{"error":{"message":"tool calls and tool results do not match"}}`, ErrRequestRejected},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

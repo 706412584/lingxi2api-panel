@@ -38,9 +38,9 @@ func TestClassify(t *testing.T) {
 		{403, `{"code":"11-128","msg":"request illegal"}`, ErrChannelRefused},
 		{400, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
 		{403, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
-		// 无 code 的裸 "request illegal" 不归属任何账号级判定（宁可走通用 4xx 兜底，
-		// 也不能凭一句文案硬禁用账号）。
-		{400, `{"msg":"request illegal"}`, ErrClient},
+		// 无 code 的裸 "request illegal" 不归属任何账号级判定（不能凭一句文案硬禁用账号）；
+		// 但 HTTP 400 仍是请求级（ErrRequestRejected：fail-fast 400、不罚号、不轮转）。
+		{400, `{"msg":"request illegal"}`, ErrRequestRejected},
 		{400, `rate limit`, ErrSoftRate},
 		{403, `usage limit reached`, ErrSoftRate},
 		// "model usage limit exceeded" 不是余额语义（无 credit/quota/积分/额度 等计费词），
@@ -52,8 +52,16 @@ func TestClassify(t *testing.T) {
 		{400, `Illegal API invocation from an unapproved channel`, ErrContentBlocked},
 		{400, `{"code":"11-128","msg":"blocked by security policy"}`, ErrContentBlocked},
 		{400, `unapproved channel`, ErrContentBlocked},
-		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
-		{400, `bad request`, ErrClient},
+		// HTTP 400 兜底：请求级（未识别业务码也一样）。上游 schema/参数拒绝的常见
+		// 形态就是 400 + AIError/「AI服务异常」。落 ErrClient 会轮转 + 喂连败，
+		// 把一次确定性失败放大成 503 并降权整池（2026-11-18 实案）。
+		{400, `bad request`, ErrRequestRejected},
+		{400, `{"code":"AIError","message":"AI服务异常"}`, ErrRequestRejected},
+		{413, `payload too large`, ErrRequestRejected},
+		{422, `unprocessable`, ErrRequestRejected},
+		// 401 是凭证类：另一个账号可能有效，仍按 ErrClient 轮转（不罚号）。
+		// 403 无信封体属 WAF（上方另有专门用例），不在此列。
+		{401, `bad request`, ErrClient},
 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。
 		// 这是"发给上游的 body 有问题"（网关截断已由 413 消灭，剩余为客户端畸形 JSON），
 		// 换了账号也一样 400，不罚号。具体词优先于通用 4xx。
@@ -67,8 +75,20 @@ func TestClassify(t *testing.T) {
 		// 11135 业务码须容忍 JSON 空白（5d5223d：字面量 marker 只覆盖紧凑形态）。
 		{400, `{"code": 11135, "msg":"image data invalid"}`, ErrImageInvalid},
 		{400, `{"error":{"code": "11135", "message":"image invalid"}}`, ErrImageInvalid},
-		// 防过宽：11133（模型不支持图片）不进 image_invalid。
-		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrClient},
+		// 防过宽：11133（模型不支持图片）不进 image_invalid，但仍属请求级拒绝
+		// （ErrRequestRejected：fail-fast 400、不轮转、不喂连败）。
+		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrRequestRejected},
+		{400, `{"code": 11133, "msg":"request parameters do not meet the current model requirements"}`, ErrRequestRejected},
+		{400, `{"error":{"code":"11133","message":"model_param_invalid"}}`, ErrRequestRejected},
+		// 11148「tool_call_sequence_broken」：工具调用历史断裂也是请求级——
+		// 2026-09-20/2026-11-18 实案：换号重放同一条历史必然同样 400，
+		// 落 ErrClient 会把整池账号喂成连败降权。
+		{400, `{"code":11148,"msg":"tool calls and tool results do not match, please start a new conversation and retry"}`, ErrRequestRejected},
+		{400, `{"code": 11148, "msg":"x"}`, ErrRequestRejected},
+		{400, `{"error":{"code":"tool_call_sequence_broken","message":"broken history"}}`, ErrRequestRejected},
+		// 状态码优先：429/5xx 上的同类文案仍按限流/服务端故障处理。
+		{429, `{"code":11148,"msg":"tool calls and tool results do not match"}`, ErrSoftRate},
+		{500, `{"code":11148,"msg":"tool calls and tool results do not match"}`, ErrServer},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
@@ -135,7 +155,7 @@ func TestClassify(t *testing.T) {
 		{403, `{"code":60001,"msg":"quota exceeded"}`, ErrHardCredit},
 		{403, `{"code":1,"msg":"unknown business error"}`, ErrClient},
 		// 非 403 的无信封错误体不进 WAF 分类（WAF 判定绑定 403 形态）。
-		{400, `bad request`, ErrClient},
+		{400, `bad request`, ErrRequestRejected},
 		{429, ``, ErrSoftRate},
 	}
 	for _, c := range cases {

@@ -58,6 +58,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
+	normalizeTextContent(obj)
 	dropReasoningContentParts(obj)
 	// tool 配对三步（见 tool_pairing.go）：先合并再重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
@@ -294,6 +295,72 @@ func normalizeImageURL(obj map[string]any) {
 				continue
 			}
 			part["image_url"] = map[string]any{"url": imageURL}
+		}
+	}
+}
+
+// normalizeTextContent 把「纯文本分片」content 数组折叠成纯字符串，并剥掉
+// Anthropic 专有的 cache_control。
+//
+// 定位（2026-11-18 实机，抓取失败请求原文逐项删减复现）：灵犀上游对 **content 为数组**
+// 的请求一律返回 HTTP 400 + **空 body**（无业务码），与模型无关（GLM-5.3 与
+// deepseek-v4.1-flash 同判）。同一段文本：
+//
+//	content:[{"type":"text","text":"hi"}]  → 400
+//	content:"hi"                            → 200
+//
+// 空 body 让网关侧 Classify 无从分流，此前落 ErrClient（只换号不罚）→ 轮转 3 号
+// → 末端 503，并把健康号喂成连败降权（整池 10 分钟降权的事故形态）。
+// 纯文本数组没有任何数组形态才有的语义，折叠无损；含非文本分片（image_url 等）
+// 的数组保持原样，继续走多模态通路。
+// cache_control 是 Anthropic SDK 的缓存标记，OpenAI 兼容上游不认；无论是否折叠
+// 都一并剥离（客户端混用两套 SDK 时会被带进来）。
+func normalizeTextContent(obj map[string]any) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, rawMsg := range msgs {
+		msg, ok := rawMsg.(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawPart := range parts {
+			if part, ok := rawPart.(map[string]any); ok {
+				delete(part, "cache_control")
+			}
+		}
+		if len(parts) == 0 {
+			// 空数组在上游同样被拒；空内容等价于 ""，折叠无副作用。
+			msg["content"] = ""
+			continue
+		}
+		var text strings.Builder
+		textOnly := true
+		for _, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if !ok {
+				textOnly = false
+				break
+			}
+			kind, _ := part["type"].(string)
+			if kind != "text" && kind != "input_text" {
+				textOnly = false
+				break
+			}
+			body, ok := part["text"].(string)
+			if !ok {
+				textOnly = false
+				break
+			}
+			text.WriteString(body)
+		}
+		if textOnly {
+			msg["content"] = text.String()
 		}
 	}
 }

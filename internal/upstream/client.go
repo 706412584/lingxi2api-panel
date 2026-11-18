@@ -45,6 +45,7 @@ const (
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrUpstreamBusy                  // 6021「queue.full.title」渠道级容量满载（非账号问题）→ 不罚号、不轮转，末端 503 + upstream_busy
 	ErrClient                        // 其他 4xx / 业务错误
+	ErrRequestRejected               // 请求级 400 业务码（11133 model_param_invalid / 11148 tool_call_sequence_broken）→ 不罚号、不轮转、不喂连败，末端 400 透传原文
 )
 
 func (k ErrKind) String() string {
@@ -79,6 +80,8 @@ func (k ErrKind) String() string {
 		return "channel_refused"
 	case ErrClient:
 		return "client"
+	case ErrRequestRejected:
+		return "request_rejected"
 	default:
 		return "none"
 	}
@@ -240,6 +243,35 @@ func isPromptTooLongStatus(status int) bool {
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
 var alreadyCheckinMarkers = []string{"已签到", "already"}
 var badParamsMarkerCode = `"code":11101`
+
+// toolSequenceBrokenMarkers 11148「tool_call_sequence_broken」的文案形态。上游要求
+// 「声明 tool_calls 的 assistant 之后必须紧跟它自己的工具结果」，违反即 400 +
+// 该业务码，原文文案是 "tool calls and tool results do not match, please start a
+// new conversation and retry"。这是**请求历史（客户端回放报文形状）的问题**，不是
+// 账号问题——同一段历史换任何账号重放都是同一结论。
+//
+// 网关侧已有正面修复（payload.go / lxRewriteBody 的三步：mergeAdjacentToolCalls →
+// repackToolResultBlocks → cleanupOrphanToolCalls）；这里负责兜底分类：漏网形态
+// 归 ErrRequestRejected，fail-fast 400，不再轮转/不喂连败。
+var toolSequenceBrokenMarkers = []string{
+	"tool_call_sequence_broken",
+	"tool calls and tool results do not match",
+}
+
+// isToolSequenceBroken 11148 判定：业务码走 codeMarker（JSON 空白容差），文案
+// 大小写不敏感包含匹配。
+func isToolSequenceBroken(body string) bool {
+	lower := strings.ToLower(body)
+	if codeMarker(lower, "11148") {
+		return true
+	}
+	for _, m := range toolSequenceBrokenMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) {
+			return true
+		}
+	}
+	return false
+}
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -686,6 +718,31 @@ func Classify(status int, body string) ErrKind {
 		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
 		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
 			return ErrBadParams
+		}
+		// 请求级业务码（HTTP 400）：11133 model_param_invalid 与 11148
+		// tool_call_sequence_broken。上游在这两种形态里已经明确判定「请求本身不合规」：
+		//   - 11133：模型供应商拒绝参数（含不支持图片、任意参数越界）；
+		//   - 11148：工具调用历史断裂——声明 tool_calls 的 assistant 之后没有紧跟
+		//     它自己的结果（2026-09-20 实案：拆成两条 assistant + deepseek →
+		//     503/11148，见 tool_pairing.go）。
+		// 同一 body 换任何账号都是同一结论，属于 ErrBadParams 同族：不罚号、不轮转。
+		// 若落 ErrClient 兜底，会「只换号不罚」并喂连败计数——2026-11-18 实案：
+		// 单个客户端重试 15 次 × 3 号 = 45 次 400，6 个健康号全部被降权 10 分钟，
+		// 池子只剩 1 个可用号，其它客户端的请求跟着 503。
+		if status == http.StatusBadRequest || status == http.StatusUnprocessableEntity {
+			if isModelParamInvalid(body) || isToolSequenceBroken(body) {
+				return ErrRequestRejected
+			}
+		}
+		// 兜底：HTTP 400/413/422 是「请求本身不可接受」的确定性答复，未识别的
+		// 业务码同样归请求级。上游对 schema/参数问题的常见形态就是 400 +
+		// `{"code":"AIError","message":"AI服务异常"}`——文案里没有 11133/11148，
+		// 但它对同一 body 换任何账号都是同一个 400（2026-11-18 实案：落 ErrClient
+		// 后轮转 3 号、末端 503，并把 6 个健康号喂成 10 分钟连败降权）。
+		// 401/403 不在此列：那是凭证/权限类，另一个账号可能有效，仍按 ErrClient 换号。
+		if status == http.StatusBadRequest || status == http.StatusRequestEntityTooLarge ||
+			status == http.StatusUnprocessableEntity {
+			return ErrRequestRejected
 		}
 		return ErrClient
 	}

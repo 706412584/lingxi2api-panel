@@ -926,6 +926,10 @@ func TestChatHTTP5xxPenalizes(t *testing.T) {
 	}
 }
 
+// TestChatHTTP4xxClientDoesNotPenalize HTTP 400（未识别业务码）是请求级错误：
+// fail-fast 直接回 400 透传上游原文，不轮转、不罚号、不喂连败。
+// 2026-11-18 实案：同一形态落 ErrClient 会轮转 MaxRotate 次、末端 503，并把
+// 整池健康号喂成连败降权——客户端把确定性失败当可重试，形成 503 风暴。
 func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -934,12 +938,12 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	if rec.Code != 400 {
+		t.Fatalf("code=%d body=%s (want 400: request-level error must not become 503)", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("u1")
-	if st.Cooling || st.ErrTotal != 0 {
-		t.Fatalf("generic 4xx should not penalize account: %+v", st)
+	if st.Cooling || st.ErrTotal != 0 || st.ConsecutiveFails != 0 {
+		t.Fatalf("request-level 400 must not penalize account: %+v", st)
 	}
 }
 

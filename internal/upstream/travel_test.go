@@ -55,7 +55,8 @@ func TestTravelStatusBusinessError(t *testing.T) {
 	if !errors.As(err, &ue) {
 		t.Fatalf("want *Error, got %T %v", err, err)
 	}
-	if ue.Status != 400 || ue.Kind != ErrClient {
+	// HTTP 400 属请求级（业务状态码 400/no active buddy，不是账号故障）。
+	if ue.Status != 400 || ue.Kind != ErrRequestRejected {
 		t.Errorf("status=%d kind=%v", ue.Status, ue.Kind)
 	}
 }

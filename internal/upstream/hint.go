@@ -26,9 +26,10 @@ import (
 //   - Model / ModelInCatalog / ModelSupportsImages：模型目录对该模型的
 //     supports_images 声明（目录未收录 → 不做「不支持」判定，防查不到误判成不支持）。
 //
-// 判定次序：11133/11135 上游业务码**先于** Kind 表——实测这两族归 ErrClient/
-// ErrBadParams 皆有可能（Classify 词表不含 11133），hint 层自带判定（hint 是补充
-// 说明非权威分类，误判代价只是多一条中性补充说明）；其余走 Kind 一对一映射。
+// 判定次序：11133/11135 上游业务码**先于** Kind 表——11133 现已归
+// ErrRequestRejected（11135 归 ErrImageInvalid），但上游可能以「参数无效」的
+// 泛化文案出现而未带业务码，hint 层仍自带判定（hint 是补充说明非权威分类，
+// 误判代价只是多一条中性补充说明）；其余走 Kind 一对一映射。
 func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	// 11133 model_param_invalid 家族（图片回归实测：不支持图片的模型传图，或任意
 	// 参数被模型供应商拒绝）。只有请求确实带图、且目录能对该模型做出「不支持图片」
@@ -36,6 +37,11 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	if isModelParamInvalid(msg) {
 		if ctx.HasImage && ctx.ModelInCatalog && !ctx.ModelSupportsImages {
 			return "model " + ctx.Model + " does not support images; pick one with supports_images=true from /v1/models"
+		}
+		// 已确认为请求级拒绝（Classify 归 ErrRequestRejected）时，必须明确
+		// 「换号重试无意义」——中性文案会让客户端把它当可重试错误继续重放。
+		if kind == ErrRequestRejected {
+			return "request was rejected by the model provider as a request-level error (invalid parameters); the same payload fails on every account — fix the request instead of retrying"
 		}
 		return "request parameters were rejected by the model provider; check message format and model capabilities"
 	}
@@ -69,6 +75,11 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "upstream capacity is full (queue.full); this is a channel-level issue, not an account problem; retry after a short wait"
 	case ErrModelBlocked:
 		return "upstream has no such model on this backend; switch model or retry on another account"
+	case ErrRequestRejected:
+		// 11133/11148：请求级拒绝，换号必然同样失败。措辞必须明确「重试无意义」
+		// ——否则客户端把 400 当可重试继续重放同一条历史（2026-11-18 实案：一个
+		// 客户端 15 次重试把这批账号全部连败降权，池子只剩 1 个可用号）。
+		return "request was rejected by the model provider as a request-level error (invalid parameters or broken tool-call history); the same payload fails on every account — fix the request or start a new conversation instead of retrying"
 	case ErrContentBlocked:
 		// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径
 		// （handler_test 的泄漏守卫），hint 遵守同一口径。

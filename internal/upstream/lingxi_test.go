@@ -323,3 +323,42 @@ func TestLXDevicePerAccount(t *testing.T) {
 		t.Fatalf("设备 ID 应为 32 位 hex，实际 %q", d1)
 	}
 }
+
+// TestLXRewriteBodyRepairsToolPairing 灵犀出站路径必须与 payload.go 同口径执行
+// tool 配对三步：客户端回放「背靠背 assistant.tool_calls」时上游判 400/11148，
+// 整条会话报废。此前 lxRewriteBody 只做 schema 归一，漏了配对修复。
+func TestLXRewriteBodyRepairsToolPairing(t *testing.T) {
+	body := []byte(`{"model":"deepseek-v4.1-flash","messages":[
+ {"role":"user","content":"go"},
+ {"role":"assistant","content":"","tool_calls":[{"id":"c00","type":"function","function":{"name":"LS","arguments":"{}"}}]},
+ {"role":"assistant","content":"","tool_calls":[{"id":"c01","type":"function","function":{"name":"LS","arguments":"{}"}}]},
+ {"role":"tool","tool_call_id":"c00","content":"ok"},
+ {"role":"tool","tool_call_id":"c01","content":"ok"}
+]}`)
+	out, model, err := lxRewriteBody(body)
+	if err != nil {
+		t.Fatalf("lxRewriteBody: %v", err)
+	}
+	if model != "deepseek-v4.1-flash" {
+		t.Fatalf("model=%q", model)
+	}
+	var in map[string]any
+	if err := json.Unmarshal(out, &in); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := in["messages"].([]any)
+	var assistants []map[string]any
+	for _, m := range msgs {
+		mm, _ := m.(map[string]any)
+		if mm["role"] == "assistant" {
+			assistants = append(assistants, mm)
+		}
+	}
+	if len(assistants) != 1 {
+		t.Fatalf("背靠背 assistant.tool_calls 必须合并为 1 条（上游判 11148），实际 %d: %v", len(assistants), msgs)
+	}
+	calls, _ := assistants[0]["tool_calls"].([]any)
+	if len(calls) != 2 {
+		t.Fatalf("合并后应保留 2 个 tool_calls，实际 %d", len(calls))
+	}
+}

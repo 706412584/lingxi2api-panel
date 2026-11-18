@@ -1047,6 +1047,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
+			// 11133 model_param_invalid / 11148 tool_call_sequence_broken：上游已判定
+			// 请求本身不合规（参数被供应商拒绝 / 工具调用历史断裂）。同一 body 换任何
+			// 账号都是同一结论：轮转只会把一次确定性失败放大成 MaxRotate 次上游调用，
+			// 末端还会落到「其余保持 503」，让客户端把请求级错误当成可重试。
+			// 更要紧的是 ErrClient 兜底会喂连败计数——2026-11-18 实案：某客户端对同一
+			// GLM-5.3 请求重试 15 次 × 3 号 = 45 次 400，6 个健康号全部被降权 10 分钟，
+			// 池子只剩 1 个可用号，其它客户端的请求跟着 503。
+			// 立即透传上游原文回 400，不罚号、不轮转、不喂连败。
+			if kind == upstream.ErrRequestRejected {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "request was rejected by upstream"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "request_rejected", msg,
+					h.hintOf(upstream.ErrRequestRejected, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				// 采样原始 body：上游只给一个业务码时，逐项删减复现是唯一定位手段。
+				if h.loadLive().RequestBodyDigest {
+					h.sampleFailedRequest(body, bareModel, msg)
+				}
+				return
+			}
 			// 6021「queue.full.title」渠道级容量满载：**不罚号不轮转**，立即透传
 			// 上游原文回客户端（503 + upstream_busy）。上游集群排队打满时换任何
 			// 账号都撞同一堵墙——按限流处置会逐号软冷却，实测 2 秒绞杀整池健康号
@@ -1298,6 +1323,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 含 requestId，客户端按 SDK 退避重试即可。
 			code = "upstream_busy"
 			msg = "upstream capacity is full (queue.full); retry after a short wait"
+		case upstream.ErrRequestRejected:
+			// 11133/11148 请求级拒绝（防御路径：正常已在轮转循环内 fail-fast
+			// 拦截）。400 + 上游原文，明确「同一请求换号也不会成功」——绝不能
+			// 落回默认的 503 no_healthy_account，那会把确定性失败伪装成可重试。
+			status = http.StatusBadRequest
+			code = "request_rejected"
+			msg = "request was rejected by upstream (request-level error); the same payload fails on every account"
 		case upstream.ErrModelBlocked:
 			// 11102「该后端无此模型」：上游原文（下方统一透传）已经写清了原因，但
 			// code 此前停在默认的 no_healthy_account —— 那是"服务端过载"的语义，
@@ -1610,6 +1642,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；chatCompletions
 		// 已 fail-fast 400 透传原文、终止轮转——「换号可能有不同模型权限」属 11102
 		// （ErrModelBlocked）的分类域，与本类无关。
+	case upstream.ErrRequestRejected:
+		// 11133 model_param_invalid / 11148 tool_call_sequence_broken：请求级错误。
+		// 零动作（不冷却/不熔断/不 NoteError/不喂连败）：同一 body 换任何账号都是
+		// 同一结论，chatCompletions 已 fail-fast 400 透传原文、终止轮转——该分支
+		// 只为文档完备。绝不能让这类错误走 ErrClient 兜底去喂连败计数。
 	case upstream.ErrUpstreamBusy:
 		// 6021「queue.full.title」渠道级容量满载：账号余额健康、未限流、session 未死，
 		// 换号也撞同一堵墙。零动作（不冷却/不熔断/不 NoteError/不喂连败，同

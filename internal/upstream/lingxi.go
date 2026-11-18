@@ -473,6 +473,23 @@ func lxRewriteBody(body []byte) ([]byte, string, error) {
 	// 这里是灵犀真正的出站改写入口——注意不能用 workbuddy 那套 prepareBody：
 	// ChatStreamContext 走的是 lingxiChatStream，不经 prepareBody。
 	normalizeToolSchema(in)
+	// 纯文本 content 数组折叠成字符串（见 payload.go normalizeTextContent）：
+	// 灵犀上游对任何数组形态的 content 一律 400 + 空 body（2026-11-18 实机：
+	// [{type:"text",...}] → 400，同文本字符串 → 200，GLM/deepseek 同判）。
+	// 空 body 让错误无从分类，落 ErrClient 就是 503 + 连败降权事故形态。
+	normalizeTextContent(in)
+	// tool 配对三步（与 payload.go 同序同语义：先 merge 再 repack 再 cleanup）。
+	// 此前灵犀路径只做了 schema 归一，漏了配对修复——客户端回放「背靠背
+	// assistant.tool_calls」或孤儿 tool 结果时，上游直接 400 code=11148
+	// （tool_call_sequence_broken），整条会话报废：客户端每次重试重放同一条
+	// 历史，换号也无效（不是账号问题）。这三步是「让请求通过」的安全网，
+	// 与账号无关，必须在灵犀真实出站路径上同样执行。
+	if msgs, ok := in["messages"].([]any); ok {
+		msgs, _ = mergeAdjacentToolCalls(msgs)
+		msgs, _ = repackToolResultBlocks(msgs)
+		msgs, _ = cleanupOrphanToolCalls(msgs)
+		in["messages"] = msgs
+	}
 	out, err := json.Marshal(in)
 	return out, model, err
 }
