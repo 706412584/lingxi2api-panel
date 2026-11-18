@@ -1235,7 +1235,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <thead><tr>
               <th>时间</th><th>结果</th><th>模型</th><th>账号</th>
               <th>来源 IP</th><th>User-Agent</th>
-              <th class="num">耗时</th><th class="num">Token</th><th class="num" title="按 模型倍率 × token 估算，不是上游结算值；真实扣费看「智点明细」">积分(估)</th><th>请求 ID</th>
+              <th class="num">耗时</th><th class="num" title="首个响应帧（首 token）到达耗时；非流式请求按上游 SSE 首帧记录">首字</th><th class="num">Token</th><th class="num" title="按 模型倍率 × token 估算，不是上游结算值；真实扣费看「智点明细」">积分(估)</th><th>请求 ID</th>
             </tr></thead>
             <tbody id="reqBody"></tbody>
           </table>

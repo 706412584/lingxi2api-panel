@@ -1218,7 +1218,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rc.Close()
 			return
 		}
-		resp, err := upstream.Aggregate(rc)
+		// 非流式也走上游 SSE（灵犀出站恒 stream=true）：用同一个统计读取器包一层，
+		// 首帧到达时间就是客户端视角的「首字」等待。运行日志的「首字」列因此对流式
+		// 与非流式统一口径（此前非流式恒为 "-"），tok/s 也按同一规则扣除 TTFB。
+		stats := newChatStatsReaderSince(rc, st.start)
+		resp, err := upstream.Aggregate(stats)
 		rc.Close()
 		if err != nil {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
@@ -1258,7 +1262,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
 			}
 		}
-		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, 0)
+		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, stats.TTFB())
+		st.ttfb = stats.TTFB()
 		if st.hasCache {
 			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
 		}
