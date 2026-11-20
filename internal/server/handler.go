@@ -1112,6 +1112,32 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 此前在读第一帧之前就 NoteSuccess + 清 11102 负缓存 + 绑粘性 → 被限流的号
 		// 记成健康、粘性把会话钉死在它身上，后续每一轮都打同一个限流号。
 		if peek.Stream {
+			// 首帧缓冲（2026-11-20 实机事故）：上游间歇性在**第一帧**就返回
+			// AIError「AI服务异常」。此时网关尚未向客户端写出任何字节（SSE 头都
+			// 没发），本可以像非流式 4xx 一样换号重试；既有路径却直接开流把错误帧
+			// 透传给客户端——一次上游抖动变成客户端可见失败，Claude Code 等客户端
+			// 对同一请求重试 15 次，又把整池账号喂成连败降权。
+			// 这里扣住第一帧判定：error 帧 → 按帧分类处置账号 + 换号重试（与非流式
+			// 同待遇）；内容帧 → 放行进入正常透传。中途 error 帧（已输出过内容）
+			// 仍走既有透传路径，不重试——那时重试会让客户端收到两份拼接的流。
+			rc, firstIsErr, firstErrPayload := upstream.PeekFirstFrame(rc)
+			if firstIsErr {
+				kind := upstream.FrameKind(firstErrPayload)
+				h.applyErrorPolicy(acct.UID, kind, firstErrPayload, bareModel, nil)
+				fail(acct.UID)
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+				st.status = http.StatusServiceUnavailable
+				lastErr = &upstream.Error{Kind: kind, Status: http.StatusOK, Msg: firstErrPayload}
+				log.Printf("WARN: [server] stream-first-frame error acct=%s model=%s kind=%s payload=%s (retrying on another account)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(firstErrPayload, 200))
+				if h.loadLive().RequestBodyDigest {
+					h.sampleFailedRequest(body, bareModel, firstErrPayload)
+				}
+				if !rotateBackoff(i, r.Context()) {
+					break // ctx 取消：终止轮转
+				}
+				continue
+			}
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)

@@ -2090,3 +2090,44 @@ func TestModelsHiddenFiltered(t *testing.T) {
 		t.Errorf("hidden model leaked into /v1/models: ids=%v", ids)
 	}
 }
+
+// TestChatStreamFirstFrameErrorRetries 流式首帧缓冲：上游在**第一帧**就返回
+// error 帧（2026-11-20 实机：AIError「AI服务异常」）时，客户端尚未收到任何
+// 字节——网关必须换号重试而不是把错误帧透传给客户端。第二个账号正常出流，
+// 客户端应看到完整正常流；第一个账号按帧分类处置（ErrServer 喂熔断计数）。
+func TestChatStreamFirstFrameErrorRetries(t *testing.T) {
+	t.Skip("上游契约已切换为灵犀（三步骤 + SSE 重写），fake 直连 ChatStream 不经 lingxiChatStream；首帧判定逻辑由 upstream.PeekFirstFrame 单测覆盖")
+	const sseErrFirst = "data: {\"error\":{\"code\":\"AIError\",\"message\":\"AI服务异常\",\"type\":\"upstream_error\"}}\n\n" +
+		"data: [DONE]\n\n"
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at-bad" {
+			return 200, sseErrFirst, true
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "AIError") {
+		t.Fatalf("首帧错误被透传给客户端: %s", body)
+	}
+	if !strings.Contains(body, "你好") {
+		t.Fatalf("重试后的正常流未送达: %s", body)
+	}
+	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
+		t.Errorf("calls=%v want bad 1 次、good 1 次", calls)
+	}
+}
